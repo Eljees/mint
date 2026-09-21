@@ -174,63 +174,86 @@ func GetUnixSocketAddr() (*SocketInfo, error) {
 	return nil, fmt.Errorf("docker socket not found")
 }
 
-// newVersionedClient builds a *docker.Client for host, honoring an explicit
-// apiVersion when the caller set one. When apiVersion is empty (a plain
-// "mint build"/"slim build" with no DOCKER_API_VERSION set - the common
-// case in every mintoolkit/mint#95 and slimtoolkit/slim#646 report),
-// go-dockerclient leaves the client's internal requestedAPIVersion nil for
-// its whole life (it only parses config.APIVersion into that field when the
-// string is non-empty), so every request the client sends omits the
-// "/vX.Y/" path segment. A daemon reached through a proxy - dind
-// (Docker-in-Docker: a CI runner's own container running a Docker daemon,
-// the topology behind every #95/#646 report) - reads an unversioned
-// request as coming from the oldest client it supports and rejects it
-// ("client version ... is too old"). Probing the daemon's real API version
-// with an initial Version() call and rebuilding the client with that
-// version populates requestedAPIVersion exactly as if the caller had set
-// DOCKER_API_VERSION by hand, which is the only workaround either issue
-// thread ever found.
+// discoverAPIVersion asks the daemon behind client which API version it
+// speaks. An unreachable or otherwise misbehaving daemon yields "", which
+// leaves the caller with the client it already had, so a connection problem
+// still surfaces as the same error it always did.
+func discoverAPIVersion(client *docker.Client) string {
+	env, err := client.Version()
+	if err != nil {
+		return ""
+	}
+
+	return env.Get("ApiVersion")
+}
+
+// withDiscoveredAPIVersion returns a client whose requests carry the "/vX.Y/"
+// path segment even when the caller configured no API version.
+//
+// go-dockerclient parses an API version into the client's internal
+// requestedAPIVersion only when the string it is given is non-empty, and
+// getURL() consults that field alone when it builds a request path. With no
+// version configured - a plain "mint build"/"slim build" with no
+// DOCKER_API_VERSION set, which is the case in every mintoolkit/mint#95 and
+// slimtoolkit/slim#646 report - every request the client sends omits the
+// version segment. A daemon reached through a proxy, dind (Docker-in-Docker:
+// a CI runner's own container running a Docker daemon, the topology behind
+// those reports), reads an unversioned request as coming from the oldest
+// client it supports and rejects it ("client version ... is too old"). The
+// client's own /version negotiation does not help here: it stores its result
+// in expectedAPIVersion and never copies it into requestedAPIVersion.
+//
+// rebuild constructs the replacement client for the discovered version. Each
+// construction path passes its own constructor, so the rebuilt client keeps
+// that path's transport, credentials and endpoint; this is what lets the TLS
+// and environment paths share this logic with the plain one.
+func withDiscoveredAPIVersion(
+	client *docker.Client,
+	apiVersion string,
+	rebuild func(apiVersion string) (*docker.Client, error),
+) *docker.Client {
+	if client == nil {
+		return client
+	}
+
+	if apiVersion != "" {
+		// An explicitly configured version already populates
+		// requestedAPIVersion, so the lazy self-check buys nothing. This is
+		// what the call sites did by hand before.
+		client.SkipServerVersionCheck = true
+		return client
+	}
+
+	discovered := discoverAPIVersion(client)
+	if discovered == "" {
+		return client
+	}
+
+	versioned, err := rebuild(discovered)
+	if err != nil || versioned == nil {
+		return client
+	}
+
+	// The version was just read from this very daemon, so the lazy self-check
+	// that the first request would otherwise trigger only repeats the probe
+	// that has already happened. Skipping it is exactly what happens today
+	// when a caller sets DOCKER_API_VERSION by hand.
+	versioned.SkipServerVersionCheck = true
+
+	return versioned
+}
+
+// newVersionedClient builds a plain (non-TLS) client for host and gives it the
+// daemon's API version when the caller configured none.
 func newVersionedClient(host, apiVersion string) (*docker.Client, error) {
 	client, err := docker.NewVersionedClient(host, apiVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	if apiVersion != "" {
-		client.SkipServerVersionCheck = true
-		return client, nil
-	}
-
-	env, err := client.Version()
-	if err != nil {
-		// Daemon unreachable or otherwise misbehaving: hand back the
-		// original unversioned client so callers see the same connection
-		// error they always would have, instead of masking it here.
-		return client, nil
-	}
-
-	discovered := env.Get("ApiVersion")
-	if discovered == "" {
-		return client, nil
-	}
-
-	versioned, err := docker.NewVersionedClient(host, discovered)
-	if err != nil {
-		return client, nil
-	}
-
-	// The just-discovered version must be trusted as-is: go-dockerclient's
-	// own internal version bootstrap (triggered lazily by the first request
-	// when SkipServerVersionCheck is false) builds its own "/version" probe
-	// through getURL(), which - now that requestedAPIVersion is set -
-	// prefixes even that bootstrap call with "/vX.Y/", so it would ask a
-	// real daemon for "/v1.44/version" instead of "/version" and fail to
-	// parse the (missing) result. Skipping that redundant self-check is
-	// exactly what happens today when a caller sets DOCKER_API_VERSION by
-	// hand (see the config.APIVersion != "" branches above).
-	versioned.SkipServerVersionCheck = true
-
-	return versioned, nil
+	return withDiscoveredAPIVersion(client, apiVersion, func(apiVersion string) (*docker.Client, error) {
+		return docker.NewVersionedClient(host, apiVersion)
+	}), nil
 }
 
 // New creates a new Docker client instance
@@ -262,6 +285,20 @@ func New(config *config.DockerClient) (*docker.Client, error) {
 		}
 
 		return docker.NewVersionedTLSClientFromBytes(host, cert, key, ca, apiVersion)
+	}
+
+	// newVersionedTLSClient is newTLSClient plus the version discovery the
+	// plain path gets: same certificates, same transport, and a "/vX.Y/"
+	// segment on every request when the caller configured no version.
+	newVersionedTLSClient := func(host string, certPath string, verify bool, apiVersion string) (*docker.Client, error) {
+		client, err := newTLSClient(host, certPath, verify, apiVersion)
+		if err != nil {
+			return nil, err
+		}
+
+		return withDiscoveredAPIVersion(client, apiVersion, func(apiVersion string) (*docker.Client, error) {
+			return newTLSClient(host, certPath, verify, apiVersion)
+		}), nil
 	}
 
 	//NOTE:
@@ -329,7 +366,7 @@ func New(config *config.DockerClient) (*docker.Client, error) {
 		config.UseTLS &&
 		config.VerifyTLS &&
 		config.TLSCertPath != "":
-		client, err = newTLSClient(config.Host, config.TLSCertPath, true, config.APIVersion)
+		client, err = newVersionedTLSClient(config.Host, config.TLSCertPath, true, config.APIVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -340,7 +377,7 @@ func New(config *config.DockerClient) (*docker.Client, error) {
 		config.UseTLS &&
 		!config.VerifyTLS &&
 		config.TLSCertPath != "":
-		client, err = newTLSClient(config.Host, config.TLSCertPath, false, config.APIVersion)
+		client, err = newVersionedTLSClient(config.Host, config.TLSCertPath, false, config.APIVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -361,7 +398,7 @@ func New(config *config.DockerClient) (*docker.Client, error) {
 		config.Env[EnvDockerTLSVerify] == "1" &&
 		config.Env[EnvDockerCertPath] != "" &&
 		config.Env[EnvDockerHost] != "":
-		client, err = newTLSClient(config.Env[EnvDockerHost], config.Env[EnvDockerCertPath], false, config.APIVersion)
+		client, err = newVersionedTLSClient(config.Env[EnvDockerHost], config.Env[EnvDockerCertPath], false, config.APIVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -373,6 +410,12 @@ func New(config *config.DockerClient) (*docker.Client, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// NewClientFromEnv reads DOCKER_API_VERSION itself, so the same string
+		// decides here whether a version was configured at all.
+		client = withDiscoveredAPIVersion(client, os.Getenv(EnvDockerAPIVer), func(apiVersion string) (*docker.Client, error) {
+			return docker.NewVersionedClientFromEnv(apiVersion)
+		})
 
 		log.Debug("dockerclient.New: new Docker client (env) [5]")
 
